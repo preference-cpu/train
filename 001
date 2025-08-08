@@ -1,0 +1,408 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.optimize import differential_evolution
+from scipy.interpolate import interp1d
+import multiprocessing as mp
+import os
+from sklearn.preprocessing import StandardScaler
+
+# 设置中文字体
+plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Arial"]
+plt.rcParams["axes.unicode_minus"] = False
+
+# ======================
+# 1. 数据加载与整理
+# ======================
+def load_data(file_path='附录.xlsx'):
+    """加载并整理题目提供的数据"""
+    try:
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"数据文件 '{file_path}' 不存在")
+
+        # 加载问题3相关数据
+        # Problem 2: LED光谱数据
+        df_led = pd.read_excel(file_path, sheet_name='Problem 2_LED_SPD')
+        # Problem 3: 太阳光谱时间序列数据
+        df_sun = pd.read_excel(file_path, sheet_name='Problem 3 SUN_SPD')
+
+        # 提取波长数据（处理字符串格式的波长）
+        led_wavelength = df_led['波长'].str.extract(r'(\d+)').astype(float).values.flatten()
+        sun_wavelength = df_sun['波长'].str.extract(r'(\d+)').astype(float).values.flatten()
+
+        # 提取光谱数据
+        led_channels = ['Blue', 'Green', 'Red', 'Warm White', 'Cold White']
+        led_spectra = [df_led[channel].values for channel in led_channels]
+
+        sun_times = df_sun.columns[1:]  # 时间点
+        sun_spectra = df_sun[sun_times].values.T  # 转置为(时间点, 波长)格式
+
+        print(f"数据加载完成: {len(sun_times)}个时间点, 波长范围: {led_wavelength[0]}-{led_wavelength[-1]}nm")
+
+        return {
+            'led_wavelength': led_wavelength,
+            'led_spectra': led_spectra,
+            'led_channels': led_channels,
+            'sun_wavelength': sun_wavelength,
+            'sun_spectra': sun_spectra,
+            'sun_times': sun_times
+        }
+
+    except Exception as e:
+        print(f"数据加载错误: {str(e)}")
+        raise
+
+# ======================
+# 2. 数据预处理
+# ======================
+def preprocess_data(raw_data):
+    """数据预处理主函数"""
+    processed_data = raw_data.copy()
+
+    # 2.1 缺失值处理
+    processed_data = handle_missing_values(processed_data)
+
+    # 2.2 异常值检测与处理
+    processed_data, outlier_report = detect_and_handle_outliers(processed_data)
+
+    # 2.3 数据转换（标准化）
+    processed_data, scaler = normalize_spectra(processed_data)
+
+    return processed_data, outlier_report, scaler
+
+def handle_missing_values(data):
+    """处理缺失值"""
+    # 检查LED光谱数据
+    led_missing = [np.isnan(spectrum).sum() for spectrum in data['led_spectra']]
+    # 检查太阳光谱数据
+    sun_missing = np.isnan(data['sun_spectra']).sum()
+
+    print(f"\n缺失值检查:")
+    print(f"LED光谱各通道缺失值数量: {dict(zip(data['led_channels'], led_missing))}")
+    print(f"太阳光谱总缺失值数量: {sun_missing}")
+
+    # 若存在缺失值，使用线性插值处理（时间序列特性适合线性插值）
+    if any(count > 0 for count in led_missing) or sun_missing > 0:
+        print("发现缺失值，应用线性插值法填充...")
+
+        # 处理LED光谱缺失值
+        processed_led = []
+        for spectrum in data['led_spectra']:
+            mask = np.isnan(spectrum)
+            if np.any(mask):
+                # 创建插值函数
+                interp_func = interp1d(
+                    data['led_wavelength'][~mask],
+                    spectrum[~mask],
+                    kind='linear',
+                    fill_value="extrapolate"
+                )
+                # 插值填充
+                filled = interp_func(data['led_wavelength'])
+                processed_led.append(filled)
+            else:
+                processed_led.append(spectrum)
+        data['led_spectra'] = processed_led
+
+        # 处理太阳光谱缺失值
+        sun_spectra = data['sun_spectra']
+        for i in range(sun_spectra.shape[0]):
+            spectrum = sun_spectra[i]
+            mask = np.isnan(spectrum)
+            if np.any(mask):
+                interp_func = interp1d(
+                    data['sun_wavelength'][~mask],
+                    spectrum[~mask],
+                    kind='linear',
+                    fill_value="extrapolate"
+                )
+                sun_spectra[i] = interp_func(data['sun_wavelength'])
+        data['sun_spectra'] = sun_spectra
+
+    return data
+
+def detect_and_handle_outliers(data):
+    """检测并处理异常值"""
+    outlier_report = {}
+
+    # 对每个LED通道检测异常值
+    led_outliers = {}
+    for i, (channel, spectrum) in enumerate(zip(data['led_channels'], data['led_spectra'])):
+        # 使用IQR法检测异常值
+        q1 = np.percentile(spectrum, 25)
+        q3 = np.percentile(spectrum, 75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+
+        outliers = (spectrum < lower_bound) | (spectrum > upper_bound)
+        outlier_count = np.sum(outliers)
+        led_outliers[channel] = {
+            'count': outlier_count,
+            'percentage': (outlier_count / len(spectrum)) * 100,
+            'indices': np.where(outliers)[0]
+        }
+
+        # 可视化异常值（箱线图）
+        plt.figure(figsize=(8, 4))
+        sns.boxplot(y=spectrum)
+        plt.title(f'{channel}通道光谱数据异常值检测')
+        plt.ylabel('光强')
+        plt.savefig(f'{channel}_outliers.png', dpi=300)
+        plt.close()
+
+    # 对太阳光谱检测异常值
+    sun_outliers = []
+    for i, time in enumerate(data['sun_times']):
+        spectrum = data['sun_spectra'][i]
+        q1 = np.percentile(spectrum, 25)
+        q3 = np.percentile(spectrum, 75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+
+        outliers = (spectrum < lower_bound) | (spectrum > upper_bound)
+        outlier_count = np.sum(outliers)
+        sun_outliers.append({
+            'time': time,
+            'count': outlier_count,
+            'percentage': (outlier_count / len(spectrum)) * 100,
+            'indices': np.where(outliers)[0]
+        })
+
+    # 异常值报告
+    outlier_report = {
+        'led': led_outliers,
+        'sun': sun_outliers
+    }
+
+    # 打印异常值摘要
+    print("\n异常值检测摘要:")
+    for channel, stats in led_outliers.items():
+        print(f"{channel}通道: {stats['count']}个异常值 ({stats['percentage']:.2f}%)")
+
+    # 策略：保留异常值（光谱数据中的极端值可能是真实物理现象）
+    print("异常值处理策略: 保留所有异常值（可能反映真实光谱特性）")
+
+    return data, outlier_report
+
+def normalize_spectra(data):
+    """光谱数据标准化处理"""
+    # 标准化公式: z = (x - μ) / σ
+    # 对LED光谱进行标准化
+    led_scaler = StandardScaler()
+    processed_led = []
+    for spectrum in data['led_spectra']:
+        # 标准化需要二维数组
+        normalized = led_scaler.fit_transform(spectrum.reshape(-1, 1)).flatten()
+        processed_led.append(normalized)
+
+    # 对太阳光谱进行标准化
+    sun_scaler = StandardScaler()
+    processed_sun = []
+    for spectrum in data['sun_spectra']:
+        normalized = sun_scaler.fit_transform(spectrum.reshape(-1, 1)).flatten()
+        processed_sun.append(normalized)
+
+    # 保存处理后的数据
+    data['led_spectra_normalized'] = processed_led
+    data['sun_spectra_normalized'] = processed_sun
+
+    print("\n数据标准化完成: 应用Z-score标准化 (z = (x - μ) / σ)")
+
+    # 返回标准化器用于后续可能的逆转换
+    return data, {
+        'led_scaler': led_scaler,
+        'sun_scaler': sun_scaler
+    }
+
+# ======================
+# 3. 数据补充
+# ======================
+
+def supplement_data(data):
+    """补充必要的数据（根据CIE标准和题目要求）"""
+    # 必须补充：CIE 1931标准色匹配函数（用于颜色参数计算）{insert\_element\_0\_}
+    wavelengths = data['led_wavelength']
+
+    # 基于CIE标准数据插值生成380-780nm的色匹配函数
+    base_wl = np.array([380, 400, 450, 500, 550, 600, 650, 700, 780])
+    x_bar = np.array([0.0014, 0.0042, 0.3483, 0.0049, 0.9950, 0.6310, 0.0010, 0.0000, 0.0000])
+    y_bar = np.array([0.0000, 0.0001, 0.0483, 0.3230, 0.8700, 0.3810, 0.0030, 0.0000, 0.0000])
+    z_bar = np.array([0.0065, 0.0230, 1.7470, 0.0093, 0.0003, 0.0008, 0.0000, 0.0000, 0.0000])
+
+    x_interp = interp1d(base_wl, x_bar, kind='cubic', fill_value="extrapolate")
+    y_interp = interp1d(base_wl, y_bar, kind='cubic', fill_value="extrapolate")
+    z_interp = interp1d(base_wl, z_bar, kind='cubic', fill_value="extrapolate")
+
+    # 封装补充数据（使用英文变量名避免语法问题）
+    supplementary_data = {
+        'cie_x': x_interp(wavelengths),
+        'cie_y': y_interp(wavelengths),
+        'cie_z': z_interp(wavelengths),
+        # 可选补充：视黑素作用光谱（用于mel-DER计算）{insert\_element\_1\_}
+        'melanopic': interp1d(
+            np.array([420, 440, 460, 480, 500, 520, 540]),
+            np.array([0.13, 0.45, 0.84, 1.00, 0.67, 0.22, 0.03]),
+            kind='cubic', fill_value="extrapolate"
+        )(wavelengths)
+    }
+
+    return supplementary_data  # 修正：在函数内返回数据
+# ======================
+# 4. 优化算法与目标函数
+# ======================
+def calculate_synthetic_spectrum(weights, led_spectra):
+    """计算合成光谱"""
+    num_times = len(weights) // 5
+    synthetic_spectra = []
+
+    for t in range(num_times):
+        t_weights = weights[t * 5: (t + 1) * 5]
+        # 权重归一化
+        sum_weights = np.sum(t_weights)
+        t_weights = t_weights / sum_weights if sum_weights > 1e-10 else t_weights
+        # 计算合成光谱
+        spectrum_t = np.sum([t_weights[i] * led_spectra[i] for i in range(5)], axis=0) + 1e-8
+        synthetic_spectra.append(spectrum_t)
+
+    return np.array(synthetic_spectra)
+
+def spectral_similarity(synthetic_spectra, sun_spectra):
+    """计算光谱相似度（余弦相似度）"""
+    similarities = []
+    for syn, sun in zip(synthetic_spectra, sun_spectra):
+        dot_product = np.dot(syn, sun)
+        norm_syn = np.linalg.norm(syn)
+        norm_sun = np.linalg.norm(sun)
+
+        cos_sim = dot_product / (norm_syn * norm_sun) if (norm_syn > 1e-10 and norm_sun > 1e-10) else 0.0
+        similarities.append(cos_sim)
+
+    return np.array(similarities)
+
+def objective_function(weights, led_spectra, sun_spectra):
+    """优化目标函数"""
+    num_times = len(weights) // 5
+    penalty = 0
+
+    # 权重约束惩罚
+    for t in range(num_times):
+        t_weights = weights[t * 5: (t + 1) * 5]
+        sum_weights = np.sum(t_weights)
+
+        # 权重和偏离1的惩罚
+        penalty += (sum_weights - 1) **4 * 10000
+
+        # 权重非负惩罚
+        for w in t_weights:
+            if w < 0:
+                penalty += (-w)** 2 * 10000
+
+    synthetic_spectra = calculate_synthetic_spectrum(weights, led_spectra)
+    similarities = spectral_similarity(synthetic_spectra, sun_spectra)
+    total_similarity = np.sum(similarities)
+
+    return -total_similarity + penalty
+
+# ======================
+# 5. 结果可视化与保存
+# ======================
+def visualize_results(data, synthetic_spectra, optimal_weights):
+    """可视化优化结果"""
+    # 绘制代表性时间点的光谱对比图
+    time_indices = [0, len(data['sun_times'])//2, -1]  # 早、中、晚三个时间点
+    plt.figure(figsize=(12, 10))
+
+    for i, idx in enumerate(time_indices):
+        plt.subplot(3, 1, i+1)
+        plt.plot(data['sun_wavelength'], data['sun_spectra_normalized'][idx],
+                 label='太阳光谱', color='orange', linewidth=2)
+        plt.plot(data['sun_wavelength'], synthetic_spectra[idx],
+                 label='合成光谱', color='blue', linestyle='--', linewidth=2)
+        plt.title(f'时间点: {data["sun_times"][idx]}')
+        plt.xlabel('波长 (nm)')
+        plt.ylabel('标准化光强')
+        plt.legend()
+        plt.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('光谱对比图.png', dpi=300)
+    plt.show()
+
+    # 绘制权重变化热图
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(optimal_weights, annot=False, cmap='viridis',
+                xticklabels=data['led_channels'],
+                yticklabels=data['sun_times'])
+    plt.title('各时间点LED通道权重分布')
+    plt.tight_layout()
+    plt.savefig('权重分布热图.png', dpi=300)
+    plt.show()
+
+def save_results(data, optimal_weights, similarities):
+    """保存优化结果"""
+    df_results = pd.DataFrame(optimal_weights, columns=data['led_channels'])
+    df_results.insert(0, '时间点', data['sun_times'])
+    df_results['相似度'] = similarities
+    df_results.to_csv('问题三优化结果.csv', index=False, encoding='utf-8-sig')
+    print("\n优化结果已保存至: 问题三优化结果.csv")
+    return df_results
+
+# ======================
+# 主函数
+# ======================
+def main():
+    # 1. 加载原始数据
+    raw_data = load_data()
+
+    # 2. 数据预处理
+    processed_data, outlier_report, scaler = preprocess_data(raw_data)
+
+    # 3. 数据补充
+    supplementary_data = supplement_data(processed_data)
+
+    # 4. 设置优化参数
+    num_weights = len(processed_data['sun_times']) * 5
+    bounds = [(0, 1)] * num_weights  # 权重范围
+
+    # 5. 运行优化算法
+    print("\n开始优化计算...")
+    result = differential_evolution(
+        func=objective_function,
+        bounds=bounds,
+        args=(processed_data['led_spectra_normalized'], processed_data['sun_spectra_normalized']),
+        popsize=20,
+        mutation=(0.8, 1.2),
+        recombination=0.9,
+        maxiter=200,
+        tol=1e-4,
+        disp=True,
+        workers=-1
+    )
+
+    # 6. 处理优化结果
+    optimal_weights = result.x.reshape(-1, 5)
+    synthetic_spectra = calculate_synthetic_spectrum(
+        result.x, processed_data['led_spectra_normalized']
+    )
+    similarities = spectral_similarity(synthetic_spectra, processed_data['sun_spectra_normalized'])
+    total_similarity = np.sum(similarities)
+
+    # 7. 输出结果摘要
+    print("\n===== 优化结果摘要 =====")
+    print(f"优化成功: {result.success}")
+    print(f"迭代次数: {result.nit}")
+    print(f"总相似度: {total_similarity:.6f}")
+    print("\n代表性时间点权重:")
+    for i in range(min(5, len(processed_data['sun_times']))):
+        print(f"{processed_data['sun_times'][i]}: {[round(w, 4) for w in optimal_weights[i]]}")
+
+    # 8. 可视化与保存结果
+    visualize_results(processed_data, synthetic_spectra, optimal_weights)
+    save_results(processed_data, optimal_weights, similarities)
+
+if __name__ == '__main__':
+    mp.freeze_support()
+    main()
