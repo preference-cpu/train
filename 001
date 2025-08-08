@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.optimize import differential_evolution
+from scipy.optimize import nnls
 from scipy.interpolate import interp1d
 import multiprocessing as mp
 import os
@@ -66,7 +66,7 @@ def preprocess_data(raw_data):
     # 2.2 异常值检测与处理
     processed_data, outlier_report = detect_and_handle_outliers(processed_data)
 
-    # 2.3 数据转换（标准化）
+    # 2.3 数据转换（标准化副本用于评估和可视化，不改变原始强度）
     processed_data, scaler = normalize_spectra(processed_data)
 
     return processed_data, outlier_report, scaler
@@ -188,34 +188,26 @@ def detect_and_handle_outliers(data):
     return data, outlier_report
 
 def normalize_spectra(data):
-    """光谱数据标准化处理"""
-    # 标准化公式: z = (x - μ) / σ
-    # 对LED光谱进行标准化
-    led_scaler = StandardScaler()
-    processed_led = []
-    for spectrum in data['led_spectra']:
-        # 标准化需要二维数组
-        normalized = led_scaler.fit_transform(spectrum.reshape(-1, 1)).flatten()
-        processed_led.append(normalized)
+    """生成标准化副本（不改变原始数据），用于相似度评估与可视化"""
+    # 使用按列的最小-最大归一化到[0,1]，以比较形状
+    def minmax_normalize(v: np.ndarray) -> np.ndarray:
+        v_min = np.min(v)
+        v_max = np.max(v)
+        if v_max - v_min < 1e-12:
+            return np.zeros_like(v)
+        return (v - v_min) / (v_max - v_min)
 
-    # 对太阳光谱进行标准化
-    sun_scaler = StandardScaler()
-    processed_sun = []
-    for spectrum in data['sun_spectra']:
-        normalized = sun_scaler.fit_transform(spectrum.reshape(-1, 1)).flatten()
-        processed_sun.append(normalized)
+    processed_led = [minmax_normalize(s) for s in data['led_spectra']]
+    processed_sun = [minmax_normalize(s) for s in data['sun_spectra']]
 
-    # 保存处理后的数据
     data['led_spectra_normalized'] = processed_led
     data['sun_spectra_normalized'] = processed_sun
 
-    print("\n数据标准化完成: 应用Z-score标准化 (z = (x - μ) / σ)")
+    print("\n数据标准化完成: 生成[0,1]范围的形状对比副本")
 
-    # 返回标准化器用于后续可能的逆转换
-    return data, {
-        'led_scaler': led_scaler,
-        'sun_scaler': sun_scaler
-    }
+    # 兼容旧返回结构
+    dummy_scaler = {'led_scaler': None, 'sun_scaler': None}
+    return data, dummy_scaler
 
 # ======================
 # 3. 数据补充
@@ -223,7 +215,7 @@ def normalize_spectra(data):
 
 def supplement_data(data):
     """补充必要的数据（根据CIE标准和题目要求）"""
-    # 必须补充：CIE 1931标准色匹配函数（用于颜色参数计算）{insert\_element\_0\_}
+    # 必须补充：CIE 1931标准色匹配函数（用于颜色参数计算）{insert_element_0_}
     wavelengths = data['led_wavelength']
 
     # 基于CIE标准数据插值生成380-780nm的色匹配函数
@@ -241,7 +233,7 @@ def supplement_data(data):
         'cie_x': x_interp(wavelengths),
         'cie_y': y_interp(wavelengths),
         'cie_z': z_interp(wavelengths),
-        # 可选补充：视黑素作用光谱（用于mel-DER计算）{insert\_element\_1\_}
+        # 可选补充：视黑素作用光谱（用于mel-DER计算）{insert_element_1_}
         'melanopic': interp1d(
             np.array([420, 440, 460, 480, 500, 520, 540]),
             np.array([0.13, 0.45, 0.84, 1.00, 0.67, 0.22, 0.03]),
@@ -250,80 +242,102 @@ def supplement_data(data):
     }
 
     return supplementary_data  # 修正：在函数内返回数据
-# ======================
-# 4. 优化算法与目标函数
-# ======================
-def calculate_synthetic_spectrum(weights, led_spectra):
-    """计算合成光谱"""
-    num_times = len(weights) // 5
-    synthetic_spectra = []
 
+# ======================
+# 4. 优化算法与目标函数（改为逐时刻NNLS拟合）
+# ======================
+
+def interpolate_led_to_sun_grid(led_wavelength: np.ndarray,
+                                led_spectra: list,
+                                target_wavelength: np.ndarray) -> np.ndarray:
+    """将5路LED光谱插值到太阳光谱的波长网格，返回矩阵A: (num_wl, 5)"""
+    A_columns = []
+    for spectrum in led_spectra:
+        f = interp1d(led_wavelength, spectrum, kind='linear', bounds_error=False, fill_value="extrapolate")
+        A_columns.append(f(target_wavelength))
+    A = np.stack(A_columns, axis=1)  # shape: (num_wl, 5)
+    # 保证非负
+    A[A < 0] = 0.0
+    return A
+
+def normalize_columns_minmax(A: np.ndarray) -> np.ndarray:
+    """对矩阵A按列进行min-max归一化，避免列为常数时产生除零。"""
+    A_norm = A.copy().astype(float)
+    for j in range(A.shape[1]):
+        col = A[:, j]
+        cmin, cmax = np.min(col), np.max(col)
+        if cmax - cmin < 1e-12:
+            A_norm[:, j] = 0.0
+        else:
+            A_norm[:, j] = (col - cmin) / (cmax - cmin)
+    return A_norm
+
+def fit_weights_nnls(A: np.ndarray, sun_spectra: np.ndarray) -> np.ndarray:
+    """对每个时刻独立进行NNLS拟合（按形状归一化），返回权重矩阵W: (num_times, 5)"""
+    # 目标向量按时刻min-max归一化到[0,1]
+    def mm(v: np.ndarray) -> np.ndarray:
+        vmin, vmax = np.min(v), np.max(v)
+        if vmax - vmin < 1e-12:
+            return np.zeros_like(v)
+        return (v - vmin) / (vmax - vmin)
+
+    num_times = sun_spectra.shape[0]
+    W = np.zeros((num_times, A.shape[1]))
     for t in range(num_times):
-        t_weights = weights[t * 5: (t + 1) * 5]
-        # 权重归一化
-        sum_weights = np.sum(t_weights)
-        t_weights = t_weights / sum_weights if sum_weights > 1e-10 else t_weights
-        # 计算合成光谱
-        spectrum_t = np.sum([t_weights[i] * led_spectra[i] for i in range(5)], axis=0) + 1e-8
-        synthetic_spectra.append(spectrum_t)
+        b = mm(sun_spectra[t])
+        w, _ = nnls(A, b)
+        # 归一化到和为1，便于解读
+        s = w.sum()
+        if s > 1e-12:
+            w = w / s
+        W[t] = w
+    return W
 
-    return np.array(synthetic_spectra)
+def synthesize_from_weights(A: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """根据W合成每个时刻的光谱，返回形状(num_times, num_wl)"""
+    return (A @ W.T).T
 
-def spectral_similarity(synthetic_spectra, sun_spectra):
-    """计算光谱相似度（余弦相似度）"""
-    similarities = []
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na < 1e-12 or nb < 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+def spectral_similarity(synthetic_spectra: np.ndarray, sun_spectra: np.ndarray) -> np.ndarray:
+    """计算光谱相似度（对每个时刻的余弦相似度，向量按L2归一化）"""
+    sims = []
     for syn, sun in zip(synthetic_spectra, sun_spectra):
-        dot_product = np.dot(syn, sun)
-        norm_syn = np.linalg.norm(syn)
-        norm_sun = np.linalg.norm(sun)
-
-        cos_sim = dot_product / (norm_syn * norm_sun) if (norm_syn > 1e-10 and norm_sun > 1e-10) else 0.0
-        similarities.append(cos_sim)
-
-    return np.array(similarities)
-
-def objective_function(weights, led_spectra, sun_spectra):
-    """优化目标函数"""
-    num_times = len(weights) // 5
-    penalty = 0
-
-    # 权重约束惩罚
-    for t in range(num_times):
-        t_weights = weights[t * 5: (t + 1) * 5]
-        sum_weights = np.sum(t_weights)
-
-        # 权重和偏离1的惩罚
-        penalty += (sum_weights - 1) **4 * 10000
-
-        # 权重非负惩罚
-        for w in t_weights:
-            if w < 0:
-                penalty += (-w)** 2 * 10000
-
-    synthetic_spectra = calculate_synthetic_spectrum(weights, led_spectra)
-    similarities = spectral_similarity(synthetic_spectra, sun_spectra)
-    total_similarity = np.sum(similarities)
-
-    return -total_similarity + penalty
+        sims.append(cosine_similarity(syn, sun))
+    return np.array(sims)
 
 # ======================
 # 5. 结果可视化与保存
 # ======================
+
 def visualize_results(data, synthetic_spectra, optimal_weights):
-    """可视化优化结果"""
-    # 绘制代表性时间点的光谱对比图
-    time_indices = [0, len(data['sun_times'])//2, -1]  # 早、中、晚三个时间点
+    """可视化优化结果：绘制早/中/晚三个代表性时间点的光谱形状对比，以及权重热图"""
+    # 选择代表性时间点
+    time_indices = [0, len(data['sun_times']) // 2, len(data['sun_times']) - 1]
     plt.figure(figsize=(12, 10))
 
+    # 为对比形状，将两个光谱各自做[0,1]归一化
+    def mm(v):
+        v = np.asarray(v)
+        vmin, vmax = np.min(v), np.max(v)
+        if vmax - vmin < 1e-12:
+            return np.zeros_like(v)
+        return (v - vmin) / (vmax - vmin)
+
     for i, idx in enumerate(time_indices):
-        plt.subplot(3, 1, i+1)
-        plt.plot(data['sun_wavelength'], data['sun_spectra_normalized'][idx],
+        plt.subplot(3, 1, i + 1)
+        plt.plot(data['sun_wavelength'], mm(data['sun_spectra'][idx]),
                  label='太阳光谱', color='orange', linewidth=2)
-        plt.plot(data['sun_wavelength'], synthetic_spectra[idx],
+        plt.plot(data['sun_wavelength'], mm(synthetic_spectra[idx]),
                  label='合成光谱', color='blue', linestyle='--', linewidth=2)
         plt.title(f'时间点: {data["sun_times"][idx]}')
         plt.xlabel('波长 (nm)')
-        plt.ylabel('标准化光强')
+        plt.ylabel('归一化光强')
         plt.legend()
         plt.grid(alpha=0.3)
 
@@ -353,6 +367,7 @@ def save_results(data, optimal_weights, similarities):
 # ======================
 # 主函数
 # ======================
+
 def main():
     # 1. 加载原始数据
     raw_data = load_data()
@@ -360,48 +375,39 @@ def main():
     # 2. 数据预处理
     processed_data, outlier_report, scaler = preprocess_data(raw_data)
 
-    # 3. 数据补充
-    supplementary_data = supplement_data(processed_data)
-
-    # 4. 设置优化参数
-    num_weights = len(processed_data['sun_times']) * 5
-    bounds = [(0, 1)] * num_weights  # 权重范围
-
-    # 5. 运行优化算法
-    print("\n开始优化计算...")
-    result = differential_evolution(
-        func=objective_function,
-        bounds=bounds,
-        args=(processed_data['led_spectra_normalized'], processed_data['sun_spectra_normalized']),
-        popsize=20,
-        mutation=(0.8, 1.2),
-        recombination=0.9,
-        maxiter=200,
-        tol=1e-4,
-        disp=True,
-        workers=-1
+    # 3. 波长对齐（将LED插值到太阳光谱波长网格）
+    A_raw = interpolate_led_to_sun_grid(
+        led_wavelength=processed_data['led_wavelength'],
+        led_spectra=processed_data['led_spectra'],
+        target_wavelength=processed_data['sun_wavelength']
     )
+    # 用于形状拟合的列归一化基A
+    A_shape = normalize_columns_minmax(A_raw)
 
-    # 6. 处理优化结果
-    optimal_weights = result.x.reshape(-1, 5)
-    synthetic_spectra = calculate_synthetic_spectrum(
-        result.x, processed_data['led_spectra_normalized']
-    )
-    similarities = spectral_similarity(synthetic_spectra, processed_data['sun_spectra_normalized'])
-    total_similarity = np.sum(similarities)
+    # 4. 逐时刻用NNLS求解最优权重（形状域）
+    print("\n开始逐时刻NNLS拟合...")
+    W = fit_weights_nnls(A_shape, processed_data['sun_spectra'])  # shape: (T, 5)
 
-    # 7. 输出结果摘要
+    # 5. 合成光谱与相似度（形状域）
+    synthetic_spectra_shape = synthesize_from_weights(A_shape, W)  # shape: (T, num_wl)
+    similarities = spectral_similarity(synthetic_spectra_shape, np.array([
+        (s - np.min(s)) / (np.max(s) - np.min(s)) if (np.max(s) - np.min(s)) > 1e-12 else np.zeros_like(s)
+        for s in processed_data['sun_spectra']
+    ]))
+    total_similarity = float(np.mean(similarities))
+
+    # 6. 输出结果摘要
     print("\n===== 优化结果摘要 =====")
-    print(f"优化成功: {result.success}")
-    print(f"迭代次数: {result.nit}")
-    print(f"总相似度: {total_similarity:.6f}")
+    print(f"平均相似度: {total_similarity:.4f}")
+    print(f"达到≥0.90的时间点比例: {(np.mean(similarities >= 0.90) * 100):.2f}%")
+    print(f"最低相似度: {np.min(similarities):.4f}")
     print("\n代表性时间点权重:")
-    for i in range(min(5, len(processed_data['sun_times']))):
-        print(f"{processed_data['sun_times'][i]}: {[round(w, 4) for w in optimal_weights[i]]}")
+    for i in [0, len(processed_data['sun_times']) // 2, len(processed_data['sun_times']) - 1]:
+        print(f"{processed_data['sun_times'][i]}: {[round(w, 4) for w in W[i]]}")
 
-    # 8. 可视化与保存结果
-    visualize_results(processed_data, synthetic_spectra, optimal_weights)
-    save_results(processed_data, optimal_weights, similarities)
+    # 7. 可视化与保存结果（形状域）
+    visualize_results(processed_data, synthetic_spectra_shape, W)
+    save_results(processed_data, W, similarities)
 
 if __name__ == '__main__':
     mp.freeze_support()
