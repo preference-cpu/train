@@ -7,13 +7,6 @@ from scipy.interpolate import interp1d
 import multiprocessing as mp
 import os
 from sklearn.preprocessing import StandardScaler
-from colour import SpectralDistribution, MSDS_CMFS, SPECTRAL_SHAPE_DEFAULT, XYZ_to_xyY
-from colour.colorimetry import sd_to_XYZ
-from colour.colorimetry.datasets.illuminants import SDS_ILLUMINANTS
-from colour.colorimetry.datasets.lefs import SDS_LEFS_PHOTOPIC
-from colour.quality import tm3018
-from colour.temperature import uv_to_CCT
-from colour.models import xy_to_UCS_uv
 
 # 设置中文字体
 plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Arial"]
@@ -314,79 +307,6 @@ def objective_function(weights, led_spectra, sun_spectra):
     return -total_similarity + penalty
 
 # ======================
-# 4.1 颜色与生理指标计算
-# ======================
-
-def _spd_from_arrays(wavelengths: np.ndarray, values: np.ndarray, name: str = "Test") -> SpectralDistribution:
-    data = dict(zip(wavelengths.astype(float), values.astype(float)))
-    sd = SpectralDistribution(data, name=name)
-    # 将光谱对齐到默认形状，便于后续TM-30计算
-    return sd.copy().align(SPECTRAL_SHAPE_DEFAULT)
-
-
-def compute_tm30_metrics(wavelengths: np.ndarray, spd: np.ndarray) -> tuple[float, float, float, float]:
-    """计算 TM-30 指标及 CCT/Duv（由 TM-30 规格返回）。
-    返回: (Rf, Rg, CCT, Duv)
-    """
-    sd = _spd_from_arrays(wavelengths, spd, name="Synthetic")
-    spec = tm3018.colour_fidelity_index_ANSIIESTM3018(sd, additional_data=True)
-    return float(spec.R_f), float(spec.R_g), float(spec.CCT), float(spec.D_uv)
-
-
-def compute_mel_der(wavelengths: np.ndarray, spd: np.ndarray, melanopic: np.ndarray) -> float:
-    """计算 CIE S 026 定义的 mel-DER（相对于 D65）。
-    使用：mel-DER = (∫ S·S_mel dλ / ∫ S·V(λ) dλ) / (∫ D65·S_mel dλ / ∫ D65·V(λ) dλ)
-    注意：该实现使用内置的 1924 光视效率 V(λ) 与补充的 melanopic 敏感度（近似）。
-    """
-    # Photopic V(λ)
-    v_sd = SDS_LEFS_PHOTOPIC['CIE 1924 Photopic Standard Observer']
-    v_vals = np.interp(wavelengths, v_sd.wavelengths, v_sd.values)
-
-    # D65 插值到当前波长网格
-    d65_sd = SDS_ILLUMINANTS['D65']
-    d65_vals = np.interp(wavelengths, d65_sd.wavelengths, d65_sd.values)
-
-    # 避免负值/NaN
-    S = np.clip(spd.astype(float), 0, None)
-    V = np.clip(v_vals.astype(float), 0, None)
-    M = np.clip(melanopic.astype(float), 0, None)
-    D65 = np.clip(d65_vals.astype(float), 0, None)
-
-    # 计算比率（积分的Δλ在分子分母中约消，网格一致即可）
-    mer_test = (S * M).sum() / max((S * V).sum(), 1e-12)
-    mer_d65 = (D65 * M).sum() / max((D65 * V).sum(), 1e-12)
-    return float(mer_test / max(mer_d65, 1e-12))
-
-
-def compute_metrics_batch(wavelengths: np.ndarray, spectra: np.ndarray, supplementary_data: dict) -> pd.DataFrame:
-    """对一组光谱批量计算指标，返回 DataFrame: [Rf, Rg, CCT, Duv, mel-DER]"""
-    results = {
-        'Rf': [], 'Rg': [], 'CCT': [], 'Duv': [], 'mel-DER': []
-    }
-    melanopic = supplementary_data.get('melanopic')
-    if melanopic is None or len(melanopic) != len(wavelengths):
-        raise ValueError("补充数据中的 melanopic 序列缺失或长度与波长不匹配")
-
-    for i in range(spectra.shape[0]):
-        spd = spectra[i]
-        try:
-            Rf, Rg, CCT, Duv = compute_tm30_metrics(wavelengths, spd)
-        except Exception:
-            # 退化处理：若 TM-30 失败，用 NaN 填充
-            Rf, Rg, CCT, Duv = np.nan, np.nan, np.nan, np.nan
-        try:
-            mel_der = compute_mel_der(wavelengths, spd, melanopic)
-        except Exception:
-            mel_der = np.nan
-        results['Rf'].append(Rf)
-        results['Rg'].append(Rg)
-        results['CCT'].append(CCT)
-        results['Duv'].append(Duv)
-        results['mel-DER'].append(mel_der)
-
-    return pd.DataFrame(results)
-
-# ======================
 # 5. 结果可视化与保存
 # ======================
 def visualize_results(data, synthetic_spectra, optimal_weights):
@@ -421,16 +341,11 @@ def visualize_results(data, synthetic_spectra, optimal_weights):
     plt.savefig('权重分布热图.png', dpi=300)
     plt.show()
 
-def save_results(data, optimal_weights, similarities, metrics_df: pd.DataFrame | None = None):
-    """保存优化结果（可选附加指标列）。"""
+def save_results(data, optimal_weights, similarities):
+    """保存优化结果"""
     df_results = pd.DataFrame(optimal_weights, columns=data['led_channels'])
     df_results.insert(0, '时间点', data['sun_times'])
     df_results['相似度'] = similarities
-
-    if metrics_df is not None and len(metrics_df) == len(df_results):
-        for col in metrics_df.columns:
-            df_results[col] = metrics_df[col]
-
     df_results.to_csv('问题三优化结果.csv', index=False, encoding='utf-8-sig')
     print("\n优化结果已保存至: 问题三优化结果.csv")
     return df_results
@@ -469,37 +384,24 @@ def main():
 
     # 6. 处理优化结果
     optimal_weights = result.x.reshape(-1, 5)
-    synthetic_spectra_norm = calculate_synthetic_spectrum(
+    synthetic_spectra = calculate_synthetic_spectrum(
         result.x, processed_data['led_spectra_normalized']
     )
-    similarities = spectral_similarity(synthetic_spectra_norm, processed_data['sun_spectra_normalized'])
+    similarities = spectral_similarity(synthetic_spectra, processed_data['sun_spectra_normalized'])
     total_similarity = np.sum(similarities)
 
-    # 使用相同权重在“原始LED光谱”上合成物理SPD，用于计算颜色与生理指标
-    synthetic_spectra_physical = calculate_synthetic_spectrum(
-        result.x, processed_data['led_spectra']
-    )
-
-    # 7. 计算并汇总指标
-    print("\n计算 CCT、Duv、Rf、Rg、mel-DER 指标...")
-    metrics_df = compute_metrics_batch(
-        processed_data['led_wavelength'], synthetic_spectra_physical, supplementary_data
-    )
-
-    # 8. 输出结果摘要
+    # 7. 输出结果摘要
     print("\n===== 优化结果摘要 =====")
     print(f"优化成功: {result.success}")
     print(f"迭代次数: {result.nit}")
     print(f"总相似度: {total_similarity:.6f}")
-    print("\n代表性时间点权重与指标:")
+    print("\n代表性时间点权重:")
     for i in range(min(5, len(processed_data['sun_times']))):
-        r = metrics_df.iloc[i]
-        print(f"{processed_data['sun_times'][i]}: 权重={[round(w, 4) for w in optimal_weights[i]]}, "
-              f"Rf={r['Rf']:.2f}, Rg={r['Rg']:.2f}, CCT={r['CCT']:.1f}K, Duv={r['Duv']:.5f}, mel-DER={r['mel-DER']:.3f}")
+        print(f"{processed_data['sun_times'][i]}: {[round(w, 4) for w in optimal_weights[i]]}")
 
-    # 9. 可视化与保存结果
-    visualize_results(processed_data, synthetic_spectra_norm, optimal_weights)
-    save_results(processed_data, optimal_weights, similarities, metrics_df)
+    # 8. 可视化与保存结果
+    visualize_results(processed_data, synthetic_spectra, optimal_weights)
+    save_results(processed_data, optimal_weights, similarities)
 
 if __name__ == '__main__':
     mp.freeze_support()
