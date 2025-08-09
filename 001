@@ -8,6 +8,29 @@ import multiprocessing as mp
 import os
 from sklearn.preprocessing import StandardScaler
 
+# Optional advanced colour metrics support
+try:
+    import colour
+    from colour import SpectralShape
+    from colour import SpectralDistribution
+    try:
+        # Newer versions
+        from colour.quality.ies_tm3018 import tm30_2018 as _tm30_2018
+    except Exception:
+        try:
+            from colour.quality import tm30_2018 as _tm30_2018
+        except Exception:
+            _tm30_2018 = None
+    from colour.temperature import CCT as _CCT
+    from colour.colorimetry import sd_to_XYZ
+    from colour.models import XYZ_to_UCS, UCS_to_uv
+    from colour.colorimetry import SDS_ILLUMINANTS, SDS_LUMINANCE_FUNCTIONS
+    HAS_COLOUR = True
+except Exception:
+    colour = None
+    _tm30_2018 = None
+    HAS_COLOUR = False
+
 # 设置中文字体
 plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Arial"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -244,6 +267,109 @@ def supplement_data(data):
     return supplementary_data  # 修正：在函数内返回数据
 
 # ======================
+# 3.1 高级指标计算：Rf/Rg, CCT/Duv, mel-DER
+# ======================
+
+def _sd_from_arrays(wavelengths: np.ndarray, values: np.ndarray) -> SpectralDistribution:
+    data = dict(zip(np.asarray(wavelengths).astype(float), np.asarray(values).astype(float)))
+    sd = SpectralDistribution(data)
+    # TM-30与CCT/Duv通常以5nm步进在[380,780]上工作
+    try:
+        sd = sd.align(SpectralShape(380, 780, 5))
+    except Exception:
+        pass
+    return sd
+
+def compute_tm30_rf_rg(wavelengths: np.ndarray, values: np.ndarray):
+    if not HAS_COLOUR or _tm30_2018 is None:
+        return np.nan, np.nan
+    try:
+        sd = _sd_from_arrays(wavelengths, values)
+        spec = _tm30_2018(sd)
+        return float(spec.Rf), float(spec.Rg)
+    except Exception:
+        return np.nan, np.nan
+
+def compute_cct_duv(wavelengths: np.ndarray, values: np.ndarray):
+    if not HAS_COLOUR:
+        return np.nan, np.nan
+    try:
+        sd = _sd_from_arrays(wavelengths, values)
+        XYZ = sd_to_XYZ(sd)
+        uv = UCS_to_uv(XYZ_to_UCS(XYZ))
+        CCT_value, Duv_value = _CCT(uv, method='Robertson 1968')
+        return float(CCT_value), float(Duv_value)
+    except Exception:
+        return np.nan, np.nan
+
+def _mel_weight(wavelengths: np.ndarray) -> np.ndarray:
+    # 粗略的CIE S 026:2018 melanopsin权重近似（稀疏点插值）
+    base_wl = np.array([380, 400, 420, 440, 460, 480, 500, 520, 540, 560, 580, 600, 620, 640, 660, 680, 700, 720, 740, 760, 780])
+    base_val = np.array([0.00, 0.02, 0.13, 0.45, 0.84, 1.00, 0.67, 0.22, 0.03, 0.01, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00])
+    f = interp1d(base_wl, base_val, kind='cubic', bounds_error=False, fill_value=(0.0, 0.0))
+    w = f(wavelengths)
+    w[w < 0] = 0.0
+    return w
+
+def compute_mel_DER(wavelengths: np.ndarray, values: np.ndarray):
+    """计算mel-DER = (mel/phot) / (mel/phot for D65)。"""
+    wl = np.asarray(wavelengths).astype(float)
+    spd = np.asarray(values).astype(float)
+
+    # 使用colour提供的V(λ)与D65，如无则退化到自插值近似
+    if HAS_COLOUR:
+        try:
+            vl_sd = SDS_LUMINANCE_FUNCTIONS.get('Photopic CIE 1924')
+            vl_sd = vl_sd.align(SpectralShape(380, 780, 5))
+            vl_wl = vl_sd.wavelengths
+            vl_vals = vl_sd.values
+        except Exception:
+            vl_sd = None
+            vl_wl = wl
+            vl_vals = np.ones_like(wl)
+
+        try:
+            d65_sd = SDS_ILLUMINANTS.get('D65')
+            d65_sd = d65_sd.align(SpectralShape(380, 780, 5))
+            d65_wl = d65_sd.wavelengths
+            d65_vals = d65_sd.values
+        except Exception:
+            d65_wl = wl
+            d65_vals = np.ones_like(wl)
+    else:
+        vl_wl = wl
+        vl_vals = np.ones_like(wl)
+        d65_wl = wl
+        d65_vals = np.ones_like(wl)
+
+    # 将所有数据对齐到共同波长网格
+    target_shape = np.arange(380.0, 781.0, 5.0)
+    def resample(x_wl, x_vals):
+        f = interp1d(x_wl, x_vals, kind='linear', bounds_error=False, fill_value=(0.0, 0.0))
+        return f(target_shape)
+
+    spd_rs = resample(wl, spd)
+    v_rs = resample(vl_wl, vl_vals)
+    d65_rs = resample(d65_wl, d65_vals)
+    mel_rs = _mel_weight(target_shape)
+
+    # 数值积分（梯形法）
+    def trapz(y):
+        return np.trapz(y, x=target_shape)
+
+    mel = trapz(spd_rs * mel_rs)
+    phot = trapz(spd_rs * v_rs)
+    ratio = mel / phot if phot > 1e-20 else np.nan
+
+    mel_d65 = trapz(d65_rs * mel_rs)
+    phot_d65 = trapz(d65_rs * v_rs)
+    ratio_d65 = mel_d65 / phot_d65 if phot_d65 > 1e-20 else np.nan
+
+    if np.isnan(ratio) or np.isnan(ratio_d65) or ratio_d65 == 0:
+        return np.nan
+    return float(ratio / ratio_d65)
+
+# ======================
 # 4. 优化算法与目标函数（改为逐时刻NNLS拟合）
 # ======================
 
@@ -360,6 +486,45 @@ def save_results(data, optimal_weights, similarities):
     df_results = pd.DataFrame(optimal_weights, columns=data['led_channels'])
     df_results.insert(0, '时间点', data['sun_times'])
     df_results['相似度'] = similarities
+
+    # 计算并附加高级指标（针对合成与太阳光谱）
+    syn_metrics = {
+        'Rf_syn': [], 'Rg_syn': [], 'CCT_syn': [], 'Duv_syn': [], 'melDER_syn': []
+    }
+    sun_metrics = {
+        'Rf_sun': [], 'Rg_sun': [], 'CCT_sun': [], 'Duv_sun': [], 'melDER_sun': []
+    }
+    for idx in range(len(data['sun_times'])):
+        wl = data['sun_wavelength']
+        syn_spd = data.get('synthetic_spectra_full', None)
+        syn_vals = syn_spd[idx] if syn_spd is not None else np.zeros_like(wl)
+        sun_vals = data['sun_spectra'][idx]
+
+        Rf_s, Rg_s = compute_tm30_rf_rg(wl, syn_vals)
+        CCT_s, Duv_s = compute_cct_duv(wl, syn_vals)
+        melDER_s = compute_mel_DER(wl, syn_vals)
+
+        Rf_t, Rg_t = compute_tm30_rf_rg(wl, sun_vals)
+        CCT_t, Duv_t = compute_cct_duv(wl, sun_vals)
+        melDER_t = compute_mel_DER(wl, sun_vals)
+
+        syn_metrics['Rf_syn'].append(Rf_s)
+        syn_metrics['Rg_syn'].append(Rg_s)
+        syn_metrics['CCT_syn'].append(CCT_s)
+        syn_metrics['Duv_syn'].append(Duv_s)
+        syn_metrics['melDER_syn'].append(melDER_s)
+
+        sun_metrics['Rf_sun'].append(Rf_t)
+        sun_metrics['Rg_sun'].append(Rg_t)
+        sun_metrics['CCT_sun'].append(CCT_t)
+        sun_metrics['Duv_sun'].append(Duv_t)
+        sun_metrics['melDER_sun'].append(melDER_t)
+
+    for k, v in syn_metrics.items():
+        df_results[k] = v
+    for k, v in sun_metrics.items():
+        df_results[k] = v
+
     df_results.to_csv('问题三优化结果.csv', index=False, encoding='utf-8-sig')
     print("\n优化结果已保存至: 问题三优化结果.csv")
     return df_results
@@ -396,14 +561,26 @@ def main():
     ]))
     total_similarity = float(np.mean(similarities))
 
+    # 生成未归一化的合成光谱（用于物理量与高级指标计算）
+    synthetic_spectra_full = synthesize_from_weights(A_raw, W)
+    processed_data['synthetic_spectra_full'] = synthetic_spectra_full
+
     # 6. 输出结果摘要
     print("\n===== 优化结果摘要 =====")
     print(f"平均相似度: {total_similarity:.4f}")
     print(f"达到≥0.90的时间点比例: {(np.mean(similarities >= 0.90) * 100):.2f}%")
     print(f"最低相似度: {np.min(similarities):.4f}")
-    print("\n代表性时间点权重:")
-    for i in [0, len(processed_data['sun_times']) // 2, len(processed_data['sun_times']) - 1]:
-        print(f"{processed_data['sun_times'][i]}: {[round(w, 4) for w in W[i]]}")
+
+    # 代表性时间点附加显示CCT、Duv、mel-DER、Rf、Rg
+    reps = [0, len(processed_data['sun_times']) // 2, len(processed_data['sun_times']) - 1]
+    print("\n代表性时间点指标(合成光谱):")
+    for i in reps:
+        wl = processed_data['sun_wavelength']
+        spd_syn = synthetic_spectra_full[i]
+        Rf, Rg = compute_tm30_rf_rg(wl, spd_syn)
+        CCT_v, Duv_v = compute_cct_duv(wl, spd_syn)
+        melDER_v = compute_mel_DER(wl, spd_syn)
+        print(f"{processed_data['sun_times'][i]} | Rf={Rf:.1f}, Rg={Rg:.1f}, CCT={CCT_v:.0f}K, Duv={Duv_v:.4f}, mel-DER={melDER_v:.3f}")
 
     # 7. 可视化与保存结果（形状域）
     visualize_results(processed_data, synthetic_spectra_shape, W)
